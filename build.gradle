@@ -161,9 +161,11 @@ tasks.register('createCombinedReport') {
 
 tasks.register('integrationTest', Test) {
     dependsOn 'stageNativeJar'
+    dependsOn 'cargoBuild'
     useJUnitPlatform()
     testClassesDirs = sourceSets.integrationTest.output.classesDirs
     classpath = sourceSets.integrationTest.runtimeClasspath
+    systemProperty 'java.library.path', file('target/debug').absolutePath
     // use target/release for a release build
     testLogging {
         showStandardStreams = true
@@ -172,6 +174,12 @@ tasks.register('integrationTest', Test) {
         showCauses = true
         showStackTraces = true
     }
+}
+
+tasks.register('cargoBuild', Exec) {
+    description = 'Builds the native Rust library for local tests.'
+    group = 'build'
+    commandLine 'cargo', 'build'
 }
 
 project.afterEvaluate {
