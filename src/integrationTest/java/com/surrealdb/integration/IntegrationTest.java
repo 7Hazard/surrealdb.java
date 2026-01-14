@@ -1,5 +1,7 @@
 package com.surrealdb.integration;
 
+import com.surrealdb.Capabilities;
+import com.surrealdb.ExperimentalFeature;
 import com.surrealdb.Surreal;
 import com.surrealdb.SurrealException;
 import org.junit.jupiter.api.Test;
@@ -8,6 +10,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -36,6 +39,25 @@ public class IntegrationTest {
     void surreal_db_memory() throws SurrealException {
         try (Surreal surreal = new Surreal()) {
             surreal.connect("memory");
+        }
+    }
+
+    @Test
+    void experimental_record_references_capability() {
+        final String surql = "\n" +
+            "USE NAMESPACE namespace DATABASE database;\n" +
+            "DEFINE FIELD using ON house TYPE record<utility> REFERENCE ON DELETE CASCADE;\n";
+
+        try (Surreal surreal = new Surreal()) {
+            surreal.connect("memory");
+            assertThrows(SurrealException.class, () -> surreal.query(surql));
+        }
+
+        Capabilities capabilities = Capabilities.defaults()
+            .withExperimentalFeatureAllowed(ExperimentalFeature.RECORD_REFERENCES);
+        try (Surreal surreal = new Surreal()) {
+            surreal.connect("memory", capabilities);
+            assertDoesNotThrow(() -> surreal.query(surql));
         }
     }
 }

@@ -10,13 +10,15 @@ use crate::{
     return_value_array_first, return_value_array_iter, return_value_array_iter_sync,
     take_one_result, JniTypes, TOKIO_RUNTIME,
 };
-use jni::objects::{JClass, JLongArray, JObjectArray, JString};
+use jni::objects::{JClass, JIntArray, JLongArray, JObjectArray, JString};
 use jni::sys::{jboolean, jint, jlong, jlongArray, jstring};
 use jni::JNIEnv;
 use parking_lot::Mutex;
 use serde::Serialize;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::{Database, Namespace, Root};
+use surrealdb::opt::capabilities::{Capabilities, ExperimentalFeature};
+use surrealdb::opt::Config;
 use surrealdb::types::{SurrealValue, ToSql, Value};
 use surrealdb::{IndexedResults, Result, Surreal};
 
@@ -48,6 +50,180 @@ pub extern "system" fn Java_com_surrealdb_Surreal_connect<'local>(
     let addr = get_rust_string!(env, addr, || false as jboolean);
     // Connect
     if let Err(err) = TOKIO_RUNTIME.block_on(async { surreal.connect(addr).await }) {
+        return SurrealError::from(err).exception(&mut env, || false as jboolean);
+    }
+    true as jboolean
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_surrealdb_Surreal_connectWithCapabilities<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+    addr: JString<'local>,
+    scripting: jboolean,
+    guest_access: jboolean,
+    live_query_notifications: jboolean,
+    functions_mode: jint,
+    allowed_functions: JObjectArray<'local>,
+    denied_functions: JObjectArray<'local>,
+    net_mode: jint,
+    allowed_net_targets: JObjectArray<'local>,
+    denied_net_targets: JObjectArray<'local>,
+    experimental_mode: jint,
+    allowed_experimental_features: JIntArray<'local>,
+    denied_experimental_features: JIntArray<'local>,
+) -> jboolean {
+    let surreal = get_surreal_instance!(&mut env, ptr, || false as jboolean);
+    let addr = get_rust_string!(env, addr, || false as jboolean);
+
+    let mut capabilities = Capabilities::new()
+        .with_scripting(scripting != 0)
+        .with_guest_access(guest_access != 0)
+        .with_live_query_notifications(live_query_notifications != 0);
+
+    match functions_mode {
+        0 => {}
+        1 => {
+            capabilities = capabilities.with_all_functions_allowed();
+        }
+        2 => {
+            capabilities = capabilities.with_no_functions_allowed();
+        }
+        _ => {
+            return SurrealError::SurrealDBJni(format!(
+                "Invalid functions mode: {functions_mode}"
+            ))
+            .exception(&mut env, || false as jboolean)
+        }
+    }
+
+    let allowed_functions = get_rust_string_array!(&mut env, allowed_functions, || false as jboolean);
+    for func in allowed_functions {
+        match capabilities.with_function_allowed(func) {
+            Ok(caps) => capabilities = caps,
+            Err(e) => {
+                return SurrealError::SurrealDBJni(e.to_string())
+                    .exception(&mut env, || false as jboolean)
+            }
+        }
+    }
+
+    let denied_functions = get_rust_string_array!(&mut env, denied_functions, || false as jboolean);
+    for func in denied_functions {
+        match capabilities.with_function_denied(func) {
+            Ok(caps) => capabilities = caps,
+            Err(e) => {
+                return SurrealError::SurrealDBJni(e.to_string())
+                    .exception(&mut env, || false as jboolean)
+            }
+        }
+    }
+
+    match net_mode {
+        0 => {}
+        1 => {
+            capabilities = capabilities.with_all_net_targets_allowed();
+        }
+        2 => {
+            capabilities = capabilities.with_no_net_targets_allowed();
+        }
+        _ => {
+            return SurrealError::SurrealDBJni(format!("Invalid net targets mode: {net_mode}"))
+                .exception(&mut env, || false as jboolean)
+        }
+    }
+
+    let allowed_net_targets =
+        get_rust_string_array!(&mut env, allowed_net_targets, || false as jboolean);
+    for target in allowed_net_targets {
+        match capabilities.with_net_target_allowed(target) {
+            Ok(caps) => capabilities = caps,
+            Err(e) => {
+                return SurrealError::SurrealDBJni(e.to_string())
+                    .exception(&mut env, || false as jboolean)
+            }
+        }
+    }
+
+    let denied_net_targets =
+        get_rust_string_array!(&mut env, denied_net_targets, || false as jboolean);
+    for target in denied_net_targets {
+        match capabilities.with_net_target_denied(target) {
+            Ok(caps) => capabilities = caps,
+            Err(e) => {
+                return SurrealError::SurrealDBJni(e.to_string())
+                    .exception(&mut env, || false as jboolean)
+            }
+        }
+    }
+
+    match experimental_mode {
+        0 => {}
+        1 => {
+            capabilities = capabilities.with_all_experimental_features_allowed();
+        }
+        2 => {
+            capabilities = capabilities.with_no_experimental_features_allowed();
+        }
+        _ => {
+            return SurrealError::SurrealDBJni(format!(
+                "Invalid experimental mode: {experimental_mode}"
+            ))
+            .exception(&mut env, || false as jboolean)
+        }
+    }
+
+    let allowed_len = match env.get_array_length(&allowed_experimental_features) {
+        Ok(l) => l,
+        Err(e) => return SurrealError::from(e).exception(&mut env, || false as jboolean),
+    };
+    let mut allowed_values = vec![0 as jint; allowed_len as usize];
+    if let Err(e) = env.get_int_array_region(&allowed_experimental_features, 0, &mut allowed_values) {
+        return SurrealError::from(e).exception(&mut env, || false as jboolean);
+    }
+    for value in allowed_values {
+        let feature = match value {
+            0 => ExperimentalFeature::RecordReferences,
+            1 => ExperimentalFeature::GraphQl,
+            2 => ExperimentalFeature::BearerAccess,
+            3 => ExperimentalFeature::DefineApi,
+            _ => {
+                return SurrealError::SurrealDBJni(format!(
+                    "Unknown experimental feature value: {value}"
+                ))
+                .exception(&mut env, || false as jboolean)
+            }
+        };
+        capabilities = capabilities.with_experimental_feature_allowed(feature);
+    }
+
+    let denied_len = match env.get_array_length(&denied_experimental_features) {
+        Ok(l) => l,
+        Err(e) => return SurrealError::from(e).exception(&mut env, || false as jboolean),
+    };
+    let mut denied_values = vec![0 as jint; denied_len as usize];
+    if let Err(e) = env.get_int_array_region(&denied_experimental_features, 0, &mut denied_values) {
+        return SurrealError::from(e).exception(&mut env, || false as jboolean);
+    }
+    for value in denied_values {
+        let feature = match value {
+            0 => ExperimentalFeature::RecordReferences,
+            1 => ExperimentalFeature::GraphQl,
+            2 => ExperimentalFeature::BearerAccess,
+            3 => ExperimentalFeature::DefineApi,
+            _ => {
+                return SurrealError::SurrealDBJni(format!(
+                    "Unknown experimental feature value: {value}"
+                ))
+                .exception(&mut env, || false as jboolean)
+            }
+        };
+        capabilities = capabilities.with_experimental_feature_denied(feature);
+    }
+
+    let config = Config::new().capabilities(capabilities);
+    if let Err(err) = TOKIO_RUNTIME.block_on(async { surreal.connect((addr, config)).await }) {
         return SurrealError::from(err).exception(&mut env, || false as jboolean);
     }
     true as jboolean

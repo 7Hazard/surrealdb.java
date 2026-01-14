@@ -29,6 +29,23 @@ public class Surreal extends Native implements AutoCloseable {
 
     private static native boolean connect(long ptr, String connect);
 
+    private static native boolean connectWithCapabilities(
+        long ptr,
+        String connect,
+        boolean scripting,
+        boolean guestAccess,
+        boolean liveQueryNotifications,
+        int functionsMode,
+        String[] allowedFunctions,
+        String[] deniedFunctions,
+        int netMode,
+        String[] allowedNetTargets,
+        String[] deniedNetTargets,
+        int experimentalMode,
+        int[] allowedExperimentalFeatures,
+        int[] deniedExperimentalFeatures
+    );
+
     private static native String signinRoot(long ptr, String username, String password);
 
     private static native String signinNamespace(long ptr, String username, String password, String ns);
@@ -118,6 +135,35 @@ public class Surreal extends Native implements AutoCloseable {
      */
     public Surreal connect(String connect) {
         connect(getPtr(), connect);
+        return this;
+    }
+
+    /**
+     * Establishes a connection to the Surreal database using the provided connection string
+     * and capabilities configuration.
+     *
+     * @param connect      the connection string used to establish the connection
+     * @param capabilities the capabilities configuration to apply
+     * @return the current instance of the {@code Surreal} class
+     */
+    public Surreal connect(String connect, Capabilities capabilities) {
+        Objects.requireNonNull(capabilities, "capabilities");
+        connectWithCapabilities(
+            getPtr(),
+            connect,
+            capabilities.isScripting(),
+            capabilities.isGuestAccess(),
+            capabilities.isLiveQueryNotifications(),
+            capabilities.getFunctionsMode(),
+            capabilities.getAllowedFunctionsArray(),
+            capabilities.getDeniedFunctionsArray(),
+            capabilities.getNetTargetsMode(),
+            capabilities.getAllowedNetTargetsArray(),
+            capabilities.getDeniedNetTargetsArray(),
+            capabilities.getExperimentalMode(),
+            capabilities.getAllowedExperimentalFeaturesArray(),
+            capabilities.getDeniedExperimentalFeaturesArray()
+        );
         return this;
     }
 
