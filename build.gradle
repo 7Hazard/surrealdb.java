@@ -6,6 +6,9 @@ plugins {
     id 'signing'
 }
 
+import org.gradle.api.GradleException
+import java.util.Locale
+
 group 'com.surrealdb'
 version '3.0.0-SNAPSHOT'
 
@@ -31,59 +34,68 @@ configurations {
     integrationTestRuntimeOnly.extendsFrom testRuntimeOnly
 }
 
-ext.nativeJar = file("native/surrealdb-${version}.jar")
+ext.nativePlatformDir = {
+    final String vendor = (System.getProperty('java.vendor') ?: '').toLowerCase(Locale.ENGLISH)
+    final String arch = (System.getProperty('os.arch') ?: '').toLowerCase(Locale.ENGLISH)
+    final String name = (System.getProperty('os.name') ?: '').toLowerCase(Locale.ENGLISH)
+    final boolean android = vendor.contains('android')
+    final boolean linux = !android && name.contains('linux')
+    final boolean windows = !linux && name.contains('win')
+    final boolean osx = !windows && name.contains('mac')
+    final boolean intel64 = arch.contains('x86_64') || arch.contains('amd64')
+    final boolean intel32 = (!intel64 && arch.contains('i386')) || arch.contains('i686') || arch.contains('x86')
+    final boolean arm64 = arch.contains('aarch64') || arch.contains('arm64')
+    final boolean arm32 = !arm64 && (arch.contains('armv7') || arch.contains('arm'))
 
-// Fail fast, but only when the task graph contains a task that needs the file
-gradle.taskGraph.whenReady { graph ->
-    boolean needsNativeJar = graph.allTasks.any { t ->
-                t.name in ['publish', 'publishToMavenLocal'] ||
-                      (t.name.startsWith('generate') && t.name.endsWith('Publication'))
+    if (android) {
+        if (arm64) return 'android_arm64'
+        if (intel64) return 'android_64'
+        if (arm32) return 'android_arm32'
+        if (intel32) return 'android_32'
+    } else if (linux) {
+        if (arm64) return 'linux_arm64'
+        if (intel64) return 'linux_64'
+        if (arm32) return 'linux_arm32'
+        if (intel32) return 'linux_32'
+    } else if (windows) {
+        if (intel64) return 'windows_64'
+        if (intel32) return 'windows_32'
+    } else if (osx) {
+        if (arm64) return 'osx_arm64'
+        if (intel64) return 'osx_64'
     }
-
-
-
-    if (needsNativeJar && !nativeJar.exists()) {
-               throw new GradleException(
-                            "Native JAR not found at '${nativeJar}'. " +
-                                    "Build/copy it to native/ before running publishing tasks."
-               )
-    }
+    throw new GradleException("Unsupported architecture: ${arch} - name: ${name}")
 }
 
+ext.nativeLibName = System.mapLibraryName('surrealdb')
+ext.prebuiltNativeJar = file("native/surrealdb-${version}.jar")
 
+ext.isGithubActions = (System.getenv('GITHUB_ACTIONS') ?: 'false').toBoolean()
+// Local dev: embed native by default. CI: do not auto-embed (cross.yml assembles natives).
+ext.autoEmbedNative = !isGithubActions
 
-// ---------------------------------------------------------------------------
-// 2. Task that stages (copies) the external JAR into build/libs
-// ---------------------------------------------------------------------------
-tasks.register('stageNativeJar', Copy) {
-    description = 'Copies the externally built JAR (with native libs) into build/libs.'
-    group       = 'build'
-
-    from nativeJar
-    into "$buildDir/libs"
-    rename { "surrealdb-${version}.jar" }     // the file name expected by publish/sign
-}
-
-// ---------------------------------------------------------------------------
-// 3. Make sure every task that cares about the JAR sees the staged version.
-//    • jar is still executed (keeps components.java happy), but the copy task
-//      will overwrite its output afterwards.
-// ---------------------------------------------------------------------------
 tasks.named('jar') {
-    finalizedBy 'stageNativeJar'            // run jar first, then overwrite
-}
+    doLast {
+        def platform = nativePlatformDir()
+        def expectedEntry = "natives/${platform}/${nativeLibName}".toString()
+        def jarFile = archiveFile.get().asFile
 
-// All publish-to-Maven tasks must wait for the staged JAR
-tasks.withType(PublishToMavenRepository).configureEach {
-    dependsOn 'stageNativeJar'
-}
-// Metadata / POM generation tasks must wait as well
-tasks.matching { it.name.startsWith('generate') && it.name.endsWith('Publication') }
-      .configureEach { dependsOn 'stageNativeJar' }
+        // If we're not auto-embedding (e.g. GitHub Actions) and there is no prepackaged
+        // native for this platform, don't fail the build here.
+        def prepackagedNative = file("src/main/resources/${expectedEntry}")
+        if (!autoEmbedNative && !prepackagedNative.exists()) {
+            return
+        }
 
-// The generated signing task is created after evaluation; use task rules
-tasks.matching { it.name == 'signMavenJavaPublication' }.configureEach {
-    dependsOn 'stageNativeJar'
+        def zip = new java.util.zip.ZipFile(jarFile)
+        try {
+            if (zip.getEntry(expectedEntry) == null) {
+                throw new GradleException("Missing native library in JAR: ${expectedEntry} (jar: ${jarFile})")
+            }
+        } finally {
+            zip.close()
+        }
+    }
 }
 
 
@@ -91,8 +103,10 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
     // classes produced by src/main/java
     integrationTestImplementation sourceSets.main.output
-    // the staged, native-enabled JAR
-    integrationTestImplementation files("native/surrealdb-${version}.jar")
+    if (prebuiltNativeJar.exists()) {
+        // If CI (or a user) provides a prebuilt, multi-platform JAR in native/, test against it.
+        integrationTestImplementation files(prebuiltNativeJar)
+    }
 }
 
 jacoco {
@@ -160,8 +174,9 @@ tasks.register('createCombinedReport') {
 
 
 tasks.register('integrationTest', Test) {
-    dependsOn 'stageNativeJar'
-    dependsOn 'cargoBuild'
+    if (autoEmbedNative && !prebuiltNativeJar.exists()) {
+        dependsOn 'cargoBuild'
+    }
     useJUnitPlatform()
     testClassesDirs = sourceSets.integrationTest.output.classesDirs
     classpath = sourceSets.integrationTest.runtimeClasspath
@@ -180,6 +195,18 @@ tasks.register('cargoBuild', Exec) {
     description = 'Builds the native Rust library for local tests.'
     group = 'build'
     commandLine 'cargo', 'build'
+}
+
+tasks.named('processResources') {
+    def platform = nativePlatformDir()
+    def prepackagedNative = file("src/main/resources/natives/${platform}/${nativeLibName}")
+    if (autoEmbedNative && !prepackagedNative.exists()) {
+        dependsOn 'cargoBuild'
+        from("${project.projectDir}/target/debug") {
+            include nativeLibName
+            into "natives/${platform}"
+        }
+    }
 }
 
 project.afterEvaluate {
