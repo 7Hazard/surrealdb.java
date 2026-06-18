@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LiveStream.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">surrealdb</a> &gt; <a href="index.source.html" class="el_package">com.surrealdb</a> &gt; <span class="el_source">LiveStream.java</span></div><h1>LiveStream.java</h1><pre class="source lang-java linenums">package com.surrealdb;
+
+import java.util.Optional;
+
+/**
+ * Blocking iterator over live query notifications returned by
+ * {@link Surreal#selectLive(String)}.
+ *
+ * &lt;p&gt;
+ * Typical usage:
+ *
+ * &lt;pre&gt;{@code
+ * try (LiveStream stream = surreal.selectLive(&quot;person&quot;)) {
+ * 	while (true) {
+ * 		Optional&lt;LiveNotification&gt; n = stream.next();
+ * 		if (!n.isPresent())
+ * 			break; // stream closed
+ * 		process(n.get());
+ * 	}
+ * }
+ * }&lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * &lt;b&gt;Thread safety:&lt;/b&gt; {@link #next()} may be called from one thread while
+ * {@link #close()} is called from another. The {@code close()} call will
+ * unblock any thread currently waiting inside {@code next()}. The native handle
+ * is declared {@code volatile} so that the zeroing performed by {@code close()}
+ * is immediately visible to concurrent {@code next()} callers. Concurrent calls
+ * to {@code next()} from multiple threads are serialized by a mutex in the
+ * native layer.
+ */
+public class LiveStream implements AutoCloseable {
+
+	/**
+	 * Pointer to the native {@code LiveStreamChannel}. Zeroed by {@link #close()}
+	 * after the native resources have been released. Declared {@code volatile} so
+	 * that a {@code close()} on one thread is visible to a concurrent
+	 * {@code next()} on another thread.
+	 */
+	private volatile long handle;
+
+<span class="fc" id="L42">	LiveStream(long handle) {</span>
+<span class="fc" id="L43">		this.handle = handle;</span>
+<span class="fc" id="L44">	}</span>
+
+	/**
+	 * Blocks until the next notification is available, or the stream ends.
+	 *
+	 * &lt;p&gt;
+	 * Returns {@link Optional#empty()} when the stream has been closed (either
+	 * explicitly via {@link #close()} or because the server ended the live query).
+	 * If the underlying live query encounters an error, a {@link SurrealException}
+	 * is thrown.
+	 *
+	 * @return the next notification, or empty if the stream has ended
+	 * @throws SurrealException
+	 *             if the live query encounters an error
+	 */
+	public Optional&lt;LiveNotification&gt; next() {
+<span class="pc bpc" id="L60" title="1 of 2 branches missed.">		if (handle == 0) {</span>
+<span class="nc" id="L61">			return Optional.empty();</span>
+		}
+<span class="fc" id="L63">		LiveNotification n = nextNative(handle);</span>
+<span class="fc bfc" id="L64" title="All 2 branches covered.">		return n == null ? Optional.empty() : Optional.of(n);</span>
+	}
+
+	/**
+	 * Releases the live query and stops receiving notifications.
+	 *
+	 * &lt;p&gt;
+	 * If another thread is blocked inside {@link #next()}, it will be unblocked and
+	 * will return {@link Optional#empty()}. This method is idempotent: calling it
+	 * more than once has no effect.
+	 */
+	@Override
+	public void close() {
+<span class="pc bpc" id="L77" title="1 of 2 branches missed.">		if (handle != 0) {</span>
+<span class="fc" id="L78">			releaseNative(handle);</span>
+<span class="fc" id="L79">			handle = 0;</span>
+		}
+<span class="fc" id="L81">	}</span>
+
+	private static native LiveNotification nextNative(long handle);
+
+	private static native void releaseNative(long handle);
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
