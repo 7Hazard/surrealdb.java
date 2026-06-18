@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
@@ -149,6 +151,18 @@ public class Surreal extends Native implements AutoCloseable {
 
 	private static native long selectLive(long ptr, String table);
 
+	private static final Pattern LIVE_TABLE_ONLY_PATTERN = Pattern.compile("^\\s*([A-Za-z_][\\w]*)\\s*$",
+			Pattern.CASE_INSENSITIVE);
+	private static final Pattern LIVE_RECORD_ID_PATTERN = Pattern.compile(
+			"^\\s*([A-Za-z_][\\w]*)\\s*:\\s*`?([^`\\s]+)`?\\s*$",
+			Pattern.CASE_INSENSITIVE);
+	private static final Pattern LIVE_WHERE_INSIDE_PATTERN = Pattern.compile(
+			"^\\s*([A-Za-z_][\\w]*)\\s+WHERE\\s+id\\s+INSIDE\\s*\\[\\s*([A-Za-z_][\\w]*)\\s*:\\s*`?([^`\\]\\s,]+)`?\\s*\\]\\s*;?\\s*$",
+			Pattern.CASE_INSENSITIVE);
+	private static final Pattern LIVE_WHERE_FIELD_PATTERN = Pattern.compile(
+			"^\\s*([A-Za-z_][\\w]*)\\s+WHERE\\s+([A-Za-z_][\\w]*)\\s*=\\s*([A-Za-z_][\\w]*)\\s*:\\s*`?([^`\\]\\s,]+)`?\\s*;?\\s*$",
+			Pattern.CASE_INSENSITIVE);
+
 	@Override
 	final String toString(long ptr) {
 		return getClass().getName() + "[ptr=" + ptr + "]";
@@ -283,8 +297,106 @@ public class Surreal extends Native implements AutoCloseable {
 	 *             if live queries are not supported, the table does not exist, or
 	 *             the subscription fails
 	 */
-	public LiveStream selectLive(String table) {
-		return new LiveStream(selectLive(getPtr(), table));
+	public LiveStream selectLive(String target) {
+		ParsedLiveTarget parsed = ParsedLiveTarget.parse(target);
+		LiveStream stream = new LiveStream(selectLive(getPtr(), parsed.subscriptionTable));
+		return parsed.hasFilter() ? new FilteredLiveStream(stream, parsed) : stream;
+	}
+
+	private static final class ParsedLiveTarget {
+		private final String subscriptionTable;
+		private final String fieldName;
+		private final String expectedRecordId;
+
+		private ParsedLiveTarget(String subscriptionTable, String fieldName, String expectedRecordId) {
+			this.subscriptionTable = subscriptionTable;
+			this.fieldName = fieldName;
+			this.expectedRecordId = expectedRecordId;
+		}
+
+		static ParsedLiveTarget parse(String target) {
+			if (target == null || target.isBlank()) {
+				throw new SurrealException("Live query target must not be blank");
+			}
+
+			Matcher whereInside = LIVE_WHERE_INSIDE_PATTERN.matcher(target);
+			if (whereInside.matches()) {
+				String table = whereInside.group(1);
+				String recordTable = whereInside.group(2);
+				String recordId = whereInside.group(3).trim();
+				return new ParsedLiveTarget(table, "id", recordTable + ":" + recordId);
+			}
+
+			Matcher whereField = LIVE_WHERE_FIELD_PATTERN.matcher(target);
+			if (whereField.matches()) {
+				String table = whereField.group(1);
+				String field = whereField.group(2);
+				String recordTable = whereField.group(3);
+				String recordId = whereField.group(4).trim();
+				return new ParsedLiveTarget(table, field, recordTable + ":" + recordId);
+			}
+
+			Matcher recordId = LIVE_RECORD_ID_PATTERN.matcher(target);
+			if (recordId.matches()) {
+				String table = recordId.group(1);
+				String id = recordId.group(2).trim();
+				return new ParsedLiveTarget(table, "id", table + ":" + id);
+			}
+
+			Matcher tableOnly = LIVE_TABLE_ONLY_PATTERN.matcher(target);
+			if (tableOnly.matches()) {
+				return new ParsedLiveTarget(tableOnly.group(1), null, null);
+			}
+
+			return new ParsedLiveTarget(target, null, null);
+		}
+
+		boolean hasFilter() {
+			return fieldName != null && expectedRecordId != null;
+		}
+
+		boolean matches(LiveNotification notification) {
+			if (!hasFilter()) {
+				return true;
+			}
+			if (notification == null || notification.getValue() == null || !notification.getValue().isObject()) {
+				return false;
+			}
+			Value fieldValue = notification.getValue().getObject().get(fieldName);
+			if (fieldValue == null || !fieldValue.isRecordId()) {
+				return false;
+			}
+			return expectedRecordId.equals(fieldValue.getRecordId().toString());
+		}
+	}
+
+	private static final class FilteredLiveStream extends LiveStream {
+		private final LiveStream delegate;
+		private final ParsedLiveTarget target;
+
+		private FilteredLiveStream(LiveStream delegate, ParsedLiveTarget target) {
+			super(0L);
+			this.delegate = delegate;
+			this.target = target;
+		}
+
+		@Override
+		public Optional<LiveNotification> next() {
+			while (true) {
+				Optional<LiveNotification> next = delegate.next();
+				if (!next.isPresent()) {
+					return Optional.empty();
+				}
+				if (target.matches(next.get())) {
+					return next;
+				}
+			}
+		}
+
+		@Override
+		public void close() {
+			delegate.close();
+		}
 	}
 
 	/**
