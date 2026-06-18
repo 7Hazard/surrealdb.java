@@ -315,7 +315,7 @@ public class Surreal extends Native implements AutoCloseable {
 		}
 
 		static ParsedLiveTarget parse(String target) {
-			if (target == null || target.isBlank()) {
+			if (target == null || target.trim().isEmpty()) {
 				throw new SurrealException("Live query target must not be blank");
 			}
 
