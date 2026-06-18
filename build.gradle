@@ -163,6 +163,12 @@ jacoco {
 
 // Build Rust native library so tests can load it
 def nativeLibName = System.getProperty('os.name').toLowerCase().contains('mac') ? 'libsurrealdb.dylib' : (System.getProperty('os.name').toLowerCase().contains('win') ? 'surrealdb.dll' : 'libsurrealdb.so')
+def nativeResourceDirName = System.getProperty('os.name').toLowerCase().contains('mac') ?
+    (System.getProperty('os.arch').toLowerCase().contains('aarch64') || System.getProperty('os.arch').toLowerCase().contains('arm64') ? 'osx_arm64' : 'osx_64') :
+    (System.getProperty('os.name').toLowerCase().contains('win') ?
+        (System.getProperty('os.arch').toLowerCase().contains('x86_64') || System.getProperty('os.arch').toLowerCase().contains('amd64') ? 'windows_64' : 'windows_32') :
+        (System.getProperty('os.arch').toLowerCase().contains('aarch64') || System.getProperty('os.arch').toLowerCase().contains('arm64') ? 'linux_arm64' : 'linux_64'))
+
 tasks.register('cargoBuild', Exec) {
     description = 'Builds the Rust native library (debug) for tests'
     group = 'build'
@@ -175,6 +181,14 @@ tasks.register('cargoBuildRelease', Exec) {
     group = 'build'
     commandLine 'cargo', 'build', '--release'
     workingDir projectDir
+}
+
+tasks.named('processResources') {
+    dependsOn cargoBuild
+    from("target/debug") {
+        include nativeLibName
+        into "natives/${nativeResourceDirName}"
+    }
 }
 
 test {
