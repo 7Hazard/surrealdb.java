@@ -151,6 +151,8 @@ public class Surreal extends Native implements AutoCloseable {
 
 	private static native long selectLive(long ptr, String table);
 
+	private static native long selectLiveQuery(long ptr, String sql);
+
 	private static final Pattern LIVE_TABLE_ONLY_PATTERN = Pattern.compile("^\\s*([A-Za-z_][\\w]*)\\s*$",
 			Pattern.CASE_INSENSITIVE);
 	private static final Pattern LIVE_RECORD_ID_PATTERN = Pattern.compile(
@@ -301,6 +303,26 @@ public class Surreal extends Native implements AutoCloseable {
 		ParsedLiveTarget parsed = ParsedLiveTarget.parse(target);
 		LiveStream stream = new LiveStream(selectLive(getPtr(), parsed.subscriptionTable));
 		return parsed.hasFilter() ? new FilteredLiveStream(stream, parsed) : stream;
+	}
+
+	/**
+	 * Starts a live query from an exact SurrealQL {@code LIVE SELECT ...} statement.
+	 *
+	 * <p>
+	 * Unlike {@link #selectLive(String)}, this method does not parse or transform the
+	 * input. The SQL is sent as-is so server-side filtering semantics are preserved.
+	 *
+	 * @param sql
+	 *            exact {@code LIVE SELECT} statement
+	 * @return a LiveStream; the caller must call {@link LiveStream#close()} when done
+	 * @throws SurrealException
+	 *             if subscription fails or the statement is invalid
+	 */
+	public LiveStream selectLiveQuery(String sql) {
+		if (sql == null || sql.trim().isEmpty()) {
+			throw new SurrealException("Live query SQL must not be blank");
+		}
+		return new LiveStream(selectLiveQuery(getPtr(), sql));
 	}
 
 	private static final class ParsedLiveTarget {

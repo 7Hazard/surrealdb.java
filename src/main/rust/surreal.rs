@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::ops::Bound;
 use std::result::Result as StdResult;
+use std::time::Duration;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::{Database, Namespace, Record as AuthRecord, Root};
 use surrealdb::types::{RecordId, RecordIdKey, RecordIdKeyRange, SurrealValue, ToSql, Value};
@@ -536,15 +537,26 @@ pub extern "system" fn Java_com_surrealdb_Surreal_run<'local>(
 /// ```
 ///
 /// A dedicated OS thread runs `block_on` on the shared tokio runtime to drive
-/// the live-query stream.  Notifications are forwarded through an unbounded
+/// the live-query stream. Notifications are forwarded through an unbounded
 /// `async_channel` to the Java side, which reads them via `nextNative`.
 ///
-/// ## Readiness handshake
-///
-/// The background thread signals via a `std::sync::mpsc` channel once the
-/// subscription is established (`Ok(())`) or has failed (`Err(e)`).
-/// `selectLive` blocks on this signal so that errors (e.g. table does not
-/// exist) are thrown at call site instead of being deferred to `next()`.
+/// To avoid unbounded hangs during subscription establishment, the initial
+/// `select(...).live()` call is guarded by a timeout.
+fn select_live_connect_timeout_ms() -> u64 {
+    std::env::var("SURREAL_SELECT_LIVE_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+    .unwrap_or(30_000)
+}
+
+    fn live_trace_enabled() -> bool {
+        std::env::var("SURREAL_LIVE_TRACE")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    }
+
 #[no_mangle]
 pub extern "system" fn Java_com_surrealdb_Surreal_selectLive<'local>(
     mut env: EnvUnowned<'local>,
@@ -556,36 +568,72 @@ pub extern "system" fn Java_com_surrealdb_Surreal_selectLive<'local>(
         let surreal = get_surreal_ref!(env, ptr, || 0);
         let table = get_rust_string!(env, &table, || 0);
 
+        let connect_timeout = Duration::from_millis(select_live_connect_timeout_ms());
+        if live_trace_enabled() {
+            eprintln!(
+                "[surrealdb-java][live] selectLive start target='{}' timeout_ms={}",
+                table,
+                connect_timeout.as_millis()
+            );
+        }
         // Notification channel: background thread produces, nextNative consumes.
         let (tx, rx) = async_channel::unbounded();
         // Shutdown channel: dropping shutdown_tx signals the background thread to exit.
         let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
         // Readiness channel: background thread confirms subscription before we return.
-        let (ready_tx, ready_rx) =
-            std::sync::mpsc::channel::<std::result::Result<(), surrealdb::Error>>();
+        // The result carries a string so timeout and SurrealDB errors share one path.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
         let tx_thread = tx.clone();
         let surreal_clone = surreal.clone();
         let join_handle = std::thread::spawn(move || {
             TOKIO_RUNTIME.block_on(async move {
-                let mut stream = match surreal_clone.select(table).live().await {
-                    Ok(s) => {
+                let mut stream = match tokio::time::timeout(
+                    connect_timeout,
+                    surreal_clone.select(table).live(),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => {
                         let _ = ready_tx.send(Ok(()));
                         s
                     }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
+                    Ok(Err(e)) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                    Err(_) => {
+                        if live_trace_enabled() {
+                            eprintln!("[surrealdb-java][live] selectLive timeout");
+                        }
+                        let _ = ready_tx.send(Err(format!(
+                            "Live query subscription timed out after {} ms",
+                            connect_timeout.as_millis()
+                        )));
                         return;
                     }
                 };
                 loop {
                     tokio::select! {
-                        _ = shutdown_rx.recv() => break,
+                        _ = shutdown_rx.recv() => {
+                            if live_trace_enabled() {
+                                eprintln!("[surrealdb-java][live] background shutdown received");
+                            }
+                            break
+                        },
                         item = stream.next() => match item {
                             Some(i) => {
+                                if live_trace_enabled() {
+                                    eprintln!("[surrealdb-java][live] notification forwarded");
+                                }
                                 let _ = tx_thread.send(i).await;
                             }
-                            None => break,
+                            None => {
+                                if live_trace_enabled() {
+                                    eprintln!("[surrealdb-java][live] stream ended");
+                                }
+                                break
+                            },
                         },
                     }
                 }
@@ -594,10 +642,128 @@ pub extern "system" fn Java_com_surrealdb_Surreal_selectLive<'local>(
 
         // Block until the subscription is confirmed or fails.
         match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            Ok(Ok(())) => {
+                if live_trace_enabled() {
+                    eprintln!("[surrealdb-java][live] selectLive subscribed");
+                }
+            }
+            Ok(Err(message)) => {
                 let _ = join_handle.join();
-                return SurrealError::from(e).exception(env, || 0);
+                return SurrealError::SurrealDBJni(message).exception(env, || 0);
+            }
+            Err(_) => {
+                let _ = join_handle.join();
+                return SurrealError::SurrealDBJni(
+                    "Live query background thread exited unexpectedly".to_string(),
+                )
+                .exception(env, || 0);
+            }
+        }
+
+        let recv_mutex = std::sync::Arc::new(parking_lot::Mutex::new(()));
+        JniTypes::new_live_stream((
+            recv_mutex,
+            parking_lot::Mutex::new(Some(join_handle)),
+            parking_lot::Mutex::new(Some(shutdown_tx)),
+            parking_lot::Mutex::new(Some(rx)),
+        ))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_surrealdb_Surreal_selectLiveQuery<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+    sql: JString<'local>,
+) -> jlong {
+    with_env_body!(env, env, {
+        let surreal = get_surreal_ref!(env, ptr, || 0);
+        let sql = get_rust_string!(env, &sql, || 0);
+
+        let connect_timeout = Duration::from_millis(select_live_connect_timeout_ms());
+        if live_trace_enabled() {
+            eprintln!(
+                "[surrealdb-java][live] selectLiveQuery start timeout_ms={} sql='{}'",
+                connect_timeout.as_millis(),
+                sql
+            );
+        }
+
+        // Notification channel: background thread produces, nextNative consumes.
+        let (tx, rx) = async_channel::unbounded();
+        // Shutdown channel: dropping shutdown_tx signals the background thread to exit.
+        let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
+        // Readiness channel: background thread confirms subscription before we return.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+
+        let tx_thread = tx.clone();
+        let surreal_clone = surreal.clone();
+        let join_handle = std::thread::spawn(move || {
+            TOKIO_RUNTIME.block_on(async move {
+                let mut stream = match tokio::time::timeout(connect_timeout, async {
+                    let mut response = surreal_clone.query(sql).await?;
+                    response.stream::<Value>(())
+                })
+                .await
+                {
+                    Ok(Ok(s)) => {
+                        let _ = ready_tx.send(Ok(()));
+                        s
+                    }
+                    Ok(Err(e)) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                    Err(_) => {
+                        if live_trace_enabled() {
+                            eprintln!("[surrealdb-java][live] selectLiveQuery timeout");
+                        }
+                        let _ = ready_tx.send(Err(format!(
+                            "Live query subscription timed out after {} ms",
+                            connect_timeout.as_millis()
+                        )));
+                        return;
+                    }
+                };
+
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            if live_trace_enabled() {
+                                eprintln!("[surrealdb-java][live] selectLiveQuery background shutdown received");
+                            }
+                            break
+                        },
+                        item = stream.next() => match item {
+                            Some(i) => {
+                                if live_trace_enabled() {
+                                    eprintln!("[surrealdb-java][live] selectLiveQuery notification forwarded");
+                                }
+                                let _ = tx_thread.send(i).await;
+                            }
+                            None => {
+                                if live_trace_enabled() {
+                                    eprintln!("[surrealdb-java][live] selectLiveQuery stream ended");
+                                }
+                                break
+                            },
+                        },
+                    }
+                }
+            });
+        });
+
+        // Block until the subscription is confirmed or fails.
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                if live_trace_enabled() {
+                    eprintln!("[surrealdb-java][live] selectLiveQuery subscribed");
+                }
+            }
+            Ok(Err(message)) => {
+                let _ = join_handle.join();
+                return SurrealError::SurrealDBJni(message).exception(env, || 0);
             }
             Err(_) => {
                 let _ = join_handle.join();

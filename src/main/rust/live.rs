@@ -8,6 +8,13 @@ use jni::{jni_sig, jni_str, EnvUnowned};
 use crate::error::SurrealError;
 use crate::{get_instance, new_string, take_instance, JniTypes, LiveStreamChannel, TOKIO_RUNTIME};
 
+fn live_trace_enabled() -> bool {
+    std::env::var("SURREAL_LIVE_TRACE")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// JNI implementation of `LiveStream.nextNative(long handle)`.
 ///
 /// Blocks the calling thread until a live-query notification arrives or the
@@ -33,6 +40,9 @@ pub extern "system" fn Java_com_surrealdb_LiveStream_nextNative<'local>(
     handle_ptr: jlong,
 ) -> jobject {
     with_env_body!(env, env, {
+        if live_trace_enabled() {
+            eprintln!("[surrealdb-java][live] nextNative enter");
+        }
         let (recv_mutex, _join_handle_mux, _shutdown_tx_mux, rx_mux) =
             match get_instance::<LiveStreamChannel>(handle_ptr, JniTypes::LiveStream) {
                 Ok(r) => r,
@@ -46,7 +56,12 @@ pub extern "system" fn Java_com_surrealdb_LiveStream_nextNative<'local>(
         };
         let item = match TOKIO_RUNTIME.block_on(rx_ref.recv()) {
             Ok(item) => item,
-            Err(_) => return JObject::null().into_raw(),
+            Err(_) => {
+                if live_trace_enabled() {
+                    eprintln!("[surrealdb-java][live] nextNative recv closed");
+                }
+                return JObject::null().into_raw();
+            }
         };
         let notification = match item {
             Ok(n) => n,
@@ -75,7 +90,12 @@ pub extern "system" fn Java_com_surrealdb_LiveStream_nextNative<'local>(
             jni_sig!("(Ljava/lang/String;JLjava/lang/String;)V"),
             &args,
         ) {
-            Ok(obj) => obj.into_raw(),
+            Ok(obj) => {
+                if live_trace_enabled() {
+                    eprintln!("[surrealdb-java][live] nextNative emit notification");
+                }
+                obj.into_raw()
+            }
             Err(e) => SurrealError::from(e).exception(env, std::ptr::null_mut),
         }
     })
@@ -111,6 +131,9 @@ pub extern "system" fn Java_com_surrealdb_LiveStream_releaseNative<'local>(
     if handle_ptr == 0 {
         return;
     }
+    if live_trace_enabled() {
+        eprintln!("[surrealdb-java][live] releaseNative start");
+    }
     let channel_ref = match get_instance::<LiveStreamChannel>(handle_ptr, JniTypes::LiveStream) {
         Ok(r) => r,
         Err(_) => return,
@@ -124,4 +147,7 @@ pub extern "system" fn Java_com_surrealdb_LiveStream_releaseNative<'local>(
     let _rx = rx_mux.lock().take();
     drop(_recv_guard);
     let _ = take_instance::<LiveStreamChannel>(handle_ptr, JniTypes::LiveStream);
+    if live_trace_enabled() {
+        eprintln!("[surrealdb-java][live] releaseNative done");
+    }
 }
